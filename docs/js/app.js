@@ -9,8 +9,8 @@ let plan = null;
 let pdfDoc = null;  // kept in memory for catalogue rendering
 let cataloguePageNums = [];
 
-const STORE_KEY = 'mealPlan_v1';
-const CATALOGUE_KEY = 'catalogueDataURLs_v1';
+const STORE_KEY = 'mealPlan_v2';
+const CATALOGUE_KEY = 'catalogueDataURLs_v2';
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {

@@ -1,4 +1,4 @@
-const CACHE = 'plano-alimentar-v1';
+const CACHE = 'plano-alimentar-v2';
 const APP_SHELL = [
   './',
   './index.html',
@@ -9,7 +9,7 @@ const APP_SHELL = [
   './icon.png',
 ];
 
-const CDN_CACHE = 'plano-alimentar-cdn-v1';
+const CDN_CACHE = 'plano-alimentar-cdn-v2';
 const CDN_URLS = [
   'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs',
   'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs',
