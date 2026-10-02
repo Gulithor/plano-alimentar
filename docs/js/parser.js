@@ -16,7 +16,6 @@ export function parsePlan(pageTexts, fileName) {
     recipes: []
   };
 
-  // Name and objective
   for (const line of lines.slice(0, 15)) {
     if (line.startsWith('Nome:')) plan.name = line.slice(5).trim();
     else if (line.startsWith('Objetivo:')) plan.objective = line.slice(9).trim();
@@ -33,7 +32,7 @@ export function parsePlan(pageTexts, fileName) {
   return plan;
 }
 
-// ── Meal parsing ────────────────────────────────────────────────────────────
+// ── Meal parsing ─────────────────────────────────────────────────────────────
 
 const MEAL_DEFS = [
   { name: 'Pequeno-Almoço', emoji: '☀️', pattern: 'Pequeno-Almoço' },
@@ -43,32 +42,45 @@ const MEAL_DEFS = [
   { name: 'Jantar',          emoji: '🌙', pattern: 'Jantar' }
 ];
 
+// These mark the end of the meals content area
+const STOP_PATTERNS = [
+  'Recomendações', 'RECEITAS', 'O QUE É', 'LISTA DE COMPRAS',
+  'porção de carne equivale', 'porção de peixe equivale',
+  'Macronutriente', '---PAGE_BREAK---'
+];
+
 function parseMeals(text) {
   const lines = text.split('\n').map(l => l.trim());
   const meals = [];
 
-  const STOP_PATTERNS = [
-    'Recomendações', 'RECEITAS', 'O QUE É', 'LISTA DE COMPRAS',
-    '*1 porção de carne', '*1 porção de peixe', 'Macronutriente', '---PAGE_BREAK---'
-  ];
-
   for (let di = 0; di < MEAL_DEFS.length; di++) {
     const def = MEAL_DEFS[di];
-    const headerIdx = lines.findIndex(l => l.includes(def.pattern) && l.includes('(') && /\dh/.test(l));
+
+    // Find the header line: must contain the pattern name AND a time like (7h or (10h30
+    const headerIdx = lines.findIndex(l =>
+      l.includes(def.pattern) && l.includes('(') && /\(\d+h/.test(l)
+    );
     if (headerIdx === -1) continue;
 
-    const headerLine = lines[headerIdx];
-    const timeRange = extractTimeRange(headerLine);
+    const timeRange = extractTimeRange(lines[headerIdx]);
 
-    // Find where this section ends
-    const nextPatterns = MEAL_DEFS.slice(di + 1).map(d => d.pattern).concat(STOP_PATTERNS);
+    // Find section end: next meal header OR a stop pattern
+    const nextMealPatterns = MEAL_DEFS.slice(di + 1).map(d => d.pattern);
     let endIdx = lines.length;
     for (let i = headerIdx + 1; i < lines.length; i++) {
-      if (nextPatterns.some(p => lines[i].includes(p))) { endIdx = i; break; }
+      const line = lines[i];
+      // Next meal: must also be a header (has time range)
+      if (nextMealPatterns.some(p => line.includes(p) && /\(\d+h/.test(line))) {
+        endIdx = i; break;
+      }
+      // Hard stop patterns
+      if (STOP_PATTERNS.some(p => line.includes(p))) {
+        endIdx = i; break;
+      }
     }
 
-    const sectionLines = lines.slice(headerIdx + 1, endIdx);
-    const { options, extras } = parseMealContent(sectionLines);
+    const sectionLines = lines.slice(headerIdx + 1, endIdx).filter(Boolean);
+    const { options, extras } = parseMealContent(sectionLines, def.name);
 
     meals.push({ name: def.name, emoji: def.emoji, timeRange, options, extras });
   }
@@ -81,52 +93,161 @@ function extractTimeRange(header) {
   return m ? m[1] : '';
 }
 
-function parseMealContent(lines) {
+// ── Option content parsing ────────────────────────────────────────────────────
+
+const EXTRAS_PREFIXES = ['Sobremesa:', 'bebida:', 'Sem pão', 'Sem broa'];
+
+function parseMealContent(lines, mealName) {
   const options = [];
-  const extras = [];
-  const nonEmpty = lines.filter(Boolean);
+  const extrasAccum = [];
 
-  const EXTRAS_PREFIXES = ['Sobremesa:', 'bebida:', 'Sem pão', 'Sem broa'];
+  // 1. Split into OU-separated blocks
+  const blocks = splitIntoOptionBlocks(lines);
 
-  let currentItems = [];
-  let currentContext = null;
-  let inExtras = false;
-  let extrasText = '';
+  // 2. Determine display style for this meal
+  //    Component meals (Almoço, Jantar) have 3 structural items: veg + protein + carb
+  const isComponentMeal = mealName === 'Almoço' || mealName === 'Jantar';
 
-  function flushOption() {
-    const filtered = currentItems.filter(i => i.toUpperCase().trim() !== 'OU' && i.trim() !== '');
-    if (filtered.length) options.push({ context: currentContext, items: filtered });
-    currentItems = [];
-    currentContext = null;
+  for (const block of blocks) {
+    // Separate extras from content
+    const contentLines = [];
+    for (const line of block.lines) {
+      if (EXTRAS_PREFIXES.some(p => line.startsWith(p))) {
+        extrasAccum.push(line);
+      } else {
+        contentLines.push(line);
+      }
+    }
+
+    if (!contentLines.length) continue;
+
+    const items = buildItems(contentLines, isComponentMeal);
+    options.push({ context: block.context, items });
   }
 
-  for (const line of nonEmpty) {
-    // Once we hit extras, accumulate them
-    if (!inExtras && EXTRAS_PREFIXES.some(p => line.startsWith(p))) {
-      inExtras = true;
-      flushOption();
-    }
-    if (inExtras) {
-      extrasText += (extrasText ? ' ' : '') + line;
+  // Merge extras into a single string
+  const extras = extrasAccum.length ? [extrasAccum.join(' · ')] : [];
+
+  return { options, extras };
+}
+
+function splitIntoOptionBlocks(lines) {
+  const blocks = [];
+  let currentLines = [];
+  let currentContext = null;
+
+  for (const line of lines) {
+    if (EXTRAS_PREFIXES.some(p => line.startsWith(p))) {
+      // Don't split extras into blocks, they'll be handled in parseMealContent
+      currentLines.push(line);
       continue;
     }
 
     const trimmed = line.trim();
     if (trimmed.toUpperCase() === 'OU') {
-      flushOption();
-    } else if (/^\(Nos dias/i.test(trimmed) && currentItems.length === 0) {
+      if (currentLines.length || currentContext) {
+        blocks.push({ context: currentContext, lines: currentLines });
+      }
+      currentLines = [];
+      currentContext = null;
+    } else if (/^\(Nos dias/i.test(trimmed) && currentLines.length === 0) {
       currentContext = trimmed.replace(/^\(|\)$/g, '').trim();
     } else {
-      currentItems.push(trimmed);
+      currentLines.push(trimmed);
     }
   }
-  flushOption();
 
-  if (extrasText) extras.push(extrasText);
-  return { options, extras };
+  if (currentLines.length || currentContext) {
+    blocks.push({ context: currentContext, lines: currentLines });
+  }
+
+  return blocks;
 }
 
-// ── Macros ──────────────────────────────────────────────────────────────────
+// ── Item construction per display mode ───────────────────────────────────────
+
+function buildItems(lines, isComponentMeal) {
+  // Join consecutive lines that are continuations (handles PDF line-wrap)
+  const joined = joinWrappedLines(lines, isComponentMeal);
+
+  if (isComponentMeal) {
+    // Almoço/Jantar: 3 structural components (veg, protein, carb)
+    // Each component starts with: "Salada", "Legumes", a quantity, or "•"
+    return joined;
+  }
+
+  // Breakfast/snack style: single block of text, split by " + "
+  if (joined.length === 1) {
+    return splitByPlus(joined[0]);
+  }
+
+  // Multiple joined lines — split each by " + " and flatten
+  return joined.flatMap(t => splitByPlus(t));
+}
+
+// Joins consecutive PDF lines, preserving hyphens at end of lines (word-wrap artifact).
+// "Grão-de-" + "bico" → "Grão-de-bico"  (no space inserted after hyphen)
+function joinLinesHyphen(parts) {
+  let result = '';
+  for (const part of parts) {
+    if (!result) { result = part; continue; }
+    result = result.endsWith('-') ? result + part : result + ' ' + part;
+  }
+  return result.trim().replace(/\s+/g, ' ');
+}
+
+// Joins PDF line-wrapped text back into logical items.
+// For component meals: new item starts at Salada/Legumes or a quantity (180g, 150g...)
+// For other meals: join everything into one string
+function joinWrappedLines(lines, isComponentMeal) {
+  if (!isComponentMeal) {
+    return [joinLinesHyphen(lines)];
+  }
+
+  // Component meal: reconstruct wrapped bullet items
+  const items = [];
+  let currentParts = [];
+
+  const startsNewItem = (line) =>
+    /^Salada/i.test(line) ||
+    /^Legumes/i.test(line) ||
+    /^•/.test(line) ||
+    /^\d+g\s+de\s/i.test(line) ||      // "150g de Arroz"
+    /^\d+g\s+[A-Z]/i.test(line);       // "120g Batata"
+
+  for (const line of lines) {
+    if (startsNewItem(line) && currentParts.length) {
+      items.push(joinLinesHyphen(currentParts));
+      currentParts = [line];
+    } else {
+      currentParts.push(line);
+    }
+  }
+  if (currentParts.length) items.push(joinLinesHyphen(currentParts));
+
+  // Strip leading bullet char if present
+  return items.map(i => i.replace(/^[•\-]\s*/, '').trim()).filter(Boolean);
+}
+
+// Splits a text block by " + " where the next token starts with a digit or uppercase.
+// This correctly handles: "3 Tostas de Sésamo + 1 colher de Sobremesa... Queijo Cottage + 300ml Leite"
+function splitByPlus(text) {
+  if (!text) return [];
+
+  const parts = text.split(/\s\+\s(?=[\dA-ZÁÉÍÓÚÀÃÇÕ])/);
+  if (parts.length <= 1) return [text.trim()];
+
+  return parts.map(p => {
+    p = p.trim();
+    // Remove trailing unmatched closing paren (PDF line-wrap artifact)
+    const opens = (p.match(/\(/g) || []).length;
+    const closes = (p.match(/\)/g) || []).length;
+    if (closes > opens) p = p.replace(/\)+\s*$/, '').trim();
+    return p;
+  }).filter(Boolean);
+}
+
+// ── Macros ───────────────────────────────────────────────────────────────────
 
 function parseMacros(lines) {
   let proteinGrams = 0, proteinKcal = 0;
@@ -151,7 +272,7 @@ function parseMacros(lines) {
   return { proteinGrams, proteinKcal, carbsGrams, carbsKcal, fatGrams, fatKcal, totalKcal };
 }
 
-// ── Fruit portions ──────────────────────────────────────────────────────────
+// ── Fruit portions ────────────────────────────────────────────────────────────
 
 const KNOWN_FRUITS = [
   'Ameixas frescas', 'Ananás fresco', 'Banana', 'Cerejas', 'Kiwi',
@@ -172,11 +293,12 @@ function parseFruitPortions(lines) {
     for (const fruit of KNOWN_FRUITS) {
       if (line.startsWith(fruit) || line.includes(fruit)) {
         const portionText = line.slice(line.indexOf(fruit) + fruit.length).trim();
-        if (portionText && (portionText.includes('g') || portionText.match(/\d/) || portionText.includes('Metade') || portionText.includes('terço') || portionText.includes('talhada') || portionText.includes('pares') || portionText.includes('bagos') || portionText.includes('morangos') || portionText.includes('ameixas') || portionText.includes('kiwi'))) {
+        const hasPortionInfo = /\d|Metade|terço|talhada|pares|bagos|morangos|ameixas|kiwi/i.test(portionText);
+        if (portionText && hasPortionInfo) {
           portions.push({ fruit, portion: portionText });
         } else if (i + 1 < lines.length) {
           const next = lines[i + 1].trim();
-          if (next && (next.includes('g') || next.match(/\d/) || next.includes('Metade'))) {
+          if (next && /\d|Metade/i.test(next)) {
             portions.push({ fruit, portion: next });
             i++;
           }
@@ -191,24 +313,24 @@ function parseFruitPortions(lines) {
 
 function defaultFruitPortions() {
   return [
-    { fruit: 'Ameixas frescas',  portion: '2 ameixas (170 g)' },
-    { fruit: 'Ananás fresco',    portion: '1 rodela, já arranjado (130 g)' },
-    { fruit: 'Banana',           portion: 'Metade (100 g)' },
-    { fruit: 'Cerejas',          portion: '10 pares (110 g)' },
-    { fruit: 'Kiwi',             portion: '1 kiwi (130 g)' },
-    { fruit: 'Laranja / Pêssego',portion: '1 médio (200 g)' },
-    { fruit: 'Maçã',             portion: '1 pequena (120 g)' },
-    { fruit: 'Manga',            portion: '1 terço, já arranjada (100 g)' },
-    { fruit: 'Melancia',         portion: '1 talhada (420 g)' },
-    { fruit: 'Meloa',            portion: 'Metade (480 g)' },
-    { fruit: 'Morangos',         portion: '10 a 14 morangos (230 g)' },
-    { fruit: 'Pera',             portion: '1 média (160 g)' },
-    { fruit: 'Tangerina',        portion: '2 pequenas (190 g)' },
-    { fruit: 'Uva',              portion: '8 a 10 bagos (80 g)' },
+    { fruit: 'Ameixas frescas',   portion: '2 ameixas (170 g)' },
+    { fruit: 'Ananás fresco',     portion: '1 rodela, já arranjado (130 g)' },
+    { fruit: 'Banana',            portion: 'Metade (100 g)' },
+    { fruit: 'Cerejas',           portion: '10 pares (110 g)' },
+    { fruit: 'Kiwi',              portion: '1 kiwi (130 g)' },
+    { fruit: 'Laranja / Pêssego', portion: '1 médio (200 g)' },
+    { fruit: 'Maçã',              portion: '1 pequena (120 g)' },
+    { fruit: 'Manga',             portion: '1 terço, já arranjada (100 g)' },
+    { fruit: 'Melancia',          portion: '1 talhada (420 g)' },
+    { fruit: 'Meloa',             portion: 'Metade (480 g)' },
+    { fruit: 'Morangos',          portion: '10 a 14 morangos (230 g)' },
+    { fruit: 'Pera',              portion: '1 média (160 g)' },
+    { fruit: 'Tangerina',         portion: '2 pequenas (190 g)' },
+    { fruit: 'Uva',               portion: '8 a 10 bagos (80 g)' },
   ];
 }
 
-// ── Portion guides ───────────────────────────────────────────────────────────
+// ── Portion guides ────────────────────────────────────────────────────────────
 
 function parsePortionGuides(lines) {
   const DEFAULT_MEAT = '1 bife grande (tamanho da mão) ou 2 bifes pequenos (tamanho da palma da mão) ou 1 coxa/sobrecoxa/asa de Frango ou ½ peito de frango ou 1 costeleta do lombo de porco ou 2 nacos médios de carne estufada';
@@ -218,23 +340,21 @@ function parsePortionGuides(lines) {
   let inMeat = false, inFish = false;
 
   for (const line of lines) {
-    if (line.includes('porção de carne equivale') || line.includes('1 porção de carne')) {
-      inMeat = true; inFish = false;
-      meat += line + ' ';
-    } else if (line.includes('porção de peixe equivale') || line.includes('1 porção de peixe')) {
-      inFish = true; inMeat = false;
-      fish += line + ' ';
+    if (line.includes('porção de carne equivale')) {
+      inMeat = true; inFish = false; meat += line + ' ';
+    } else if (line.includes('porção de peixe equivale')) {
+      inFish = true; inMeat = false; fish += line + ' ';
     } else if (inMeat) {
-      if (!line || line.includes('Lanche') || line.includes('Jantar') || line.includes('Almoço')) inMeat = false;
+      if (!line || /^Lanche|^Jantar|^Almoço/.test(line)) inMeat = false;
       else meat += line + ' ';
     } else if (inFish) {
-      if (!line || line.includes('Lanche') || line.includes('Jantar') || line.includes('Almoço')) inFish = false;
+      if (!line || /^Lanche|^Jantar|^Almoço/.test(line)) inFish = false;
       else fish += line + ' ';
     }
   }
 
-  const cleanMeat = meat.replace(/\*?1 porção de carne equivale:?/i, '').trim();
-  const cleanFish = fish.replace(/\*?1 porção de peixe equivale:?/i, '').trim();
+  const cleanMeat = meat.replace(/\*?1 porção de carne equivale:?\s*/i, '').trim();
+  const cleanFish = fish.replace(/\*?1 porção de peixe equivale:?\s*/i, '').trim();
 
   return {
     meat: cleanMeat || DEFAULT_MEAT,
@@ -242,7 +362,7 @@ function parsePortionGuides(lines) {
   };
 }
 
-// ── Recipes ──────────────────────────────────────────────────────────────────
+// ── Recipes ───────────────────────────────────────────────────────────────────
 
 function parseRecipes(text) {
   const startMatch = text.match(/RECEITAS:/i);
@@ -271,8 +391,7 @@ function parseRecipes(text) {
       instructions += line + ' ';
     } else if (inInstructions) {
       instructions += line + ' ';
-    } else if (ingredients.length === 0 && line.length > 2 && line.length < 60) {
-      flush();
+    } else if (!name && line.length > 2 && line.length < 60) {
       name = line.replace(/^\*+|_+/g, '').trim();
     }
   }
